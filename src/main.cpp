@@ -1,4 +1,5 @@
 #include <spi.h>
+#include <Wire.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 #include <PubSubClient.h>
@@ -6,11 +7,26 @@
 #include <config.h> //enthält Zugangsdaten für das Heimnetz
 
 #define PCA9685_ADDR 0x40 // Adresse des PCA9685-Treibers
-#define SERVO_MIN_PULSEWIDTH 650
-#define SERVO_MAX_PULSEWIDTH 2350
-#define SERVO_MAX_DEGREE 180
+#define SERVO_MIN_PULSEWIDTH 900 //650
+#define SERVO_MAX_PULSEWIDTH 2100 //2350
+//#define SERVO_MAX_DEGREE 180
+#define SERVO_FREQ 50
+
 
 #define DEVICE "armUnit" // hier den unit-name aendern
+enum ServoID {
+  TURM = 0,
+  ARM = 1,
+  ARM1 = 2,
+  GREIFER = 3
+};
+
+// Pin-Nummern für die Servos auf dem PCA9685-Controller
+const int servoPins[] = {0, 1, 2, 3}; // Beispielwerte, anpassen entsprechend der tatsächlichen Verdrahtung
+const int servoDegrees[] = {180, 180, 180, 180};
+//const int servoMinPWM[] = {90, 90, 180, 180};
+//const int servoMaxPWM[] = {90, 90, 180, 180};
+
 
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(PCA9685_ADDR);
 
@@ -19,34 +35,110 @@ bool servoExecuted = false;
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// Funktion zum Empfangen von MQTT-Nachrichten
+ServoID getServoID(const char* typeString) {
+    Serial.print("Token: ");
+    Serial.println(typeString);
+    if (strcmp(typeString, "turm") == 0) {
+        Serial.println("ServoId erkannt: turm");
+        return TURM;
+    } else if (strcmp(typeString, "arm") == 0) {
+        return ARM;
+    } else if (strcmp(typeString, "arm1") == 0) {
+        return ARM1;
+    } else if (strcmp(typeString, "greifer") == 0) {
+        return GREIFER;
+    } else {
+        // Default-Wert oder Fehlerbehandlung
+        return TURM; // Zum Beispiel, hier könnte auch ein Default-Wert zurückgegeben werden
+    }
+}
+
+
+void controlServo(int servoIndex, int pos) {
+  // Begrenze die Position auf den erwarteten Bereich (0-180)
+  if(servoIndex >= 0 && servoIndex <= 1){
+    pos = constrain(pos, 0, servoDegrees[servoIndex]);
+  } else {
+    pos = constrain(pos, 0, servoDegrees[servoIndex]);
+  };
+  
+  // Konvertiere die Position von Grad in Pulsweite
+  uint16_t pulse = map(pos, 0, servoDegrees[servoIndex], SERVO_MIN_PULSEWIDTH, SERVO_MAX_PULSEWIDTH);
+  Serial.println(pulse);
+  // Setze die Pulsweite für den entsprechenden Servo-Kanal auf dem PCA9685-Controller
+  pwm.setPWM(servoPins[servoIndex], 0, pulse);
+}
+
+String formatStatusMessage(int servoID, int pos) {
+  return "Servo-ID " + String(servoID) + " auf " + String(pos) + " Grad gefahren";
+}
+
+void parsePayload(int servoID, int pos) {
+  // Steuern Sie den entsprechenden Servo auf dem PCA9685-Controller
+  controlServo(servoID, pos);
+
+  // Veröffentlichen Sie eine Bestätigungsnachricht
+  String topic = String(DEVICE) + "/status";
+  String statusMessage = "Servo-ID " + String(servoID) + " auf " + String(pos) + " Grad gefahren";
+  client.publish(topic.c_str(), statusMessage.c_str());
+}
+
+
 void callback(char* topic, byte* payload, unsigned int length) {
   Serial.print("Message arrived [");
   Serial.print(topic);
-  Serial.print("] ");
-  
-  // Null-terminiertes Zeichenarray erstellen
-  char message[length + 1]; // +1 für das Nullzeichen
-  memcpy(message, payload, length);
-  message[length] = '\0'; // Nullterminierung hinzufügen
-  
-  // Nachricht als String ausgeben
-  client.publish(DEVICE"/status", "Nachricht erhalten!");
+  Serial.println("] ");
 
-  // Hier können Sie die Payload weiter verarbeiten
+  // Extrahiere Servo-Typ und Servo-ID aus dem Topic
+  char* token = strtok(topic, "/");
+  // Ignoriere den ersten Token (Gerätenamen)
+  token = strtok(NULL, "/");
+  char* servoType = token;
+  int servoID = getServoID(servoType);
+  token = strtok(NULL, "/");
+  Serial.print("servoID: ");
+  Serial.println(servoID);
+
+  char posString[10];
+  memcpy(posString, payload, length);
+  posString[length] = '\0'; // Nullterminierung für die Konvertierung
+  int pos = atoi(posString);
+
+
+  // Verarbeite die Nachricht nur, wenn die Servo-ID im gültigen Bereich liegt
+  if (servoID >= TURM && servoID <= GREIFER) {
+      // Veröffentliche die verarbeiteten Daten
+      //char topicProcessed[50];
+      //snprintf(topicProcessed, sizeof(topicProcessed), "%s/%d/processed", servoType, servoID);
+      //client.publish(topicProcessed, servoType); // Veröffentliche das ursprüngliche Payload unter dem neuen Topic
+
+      // Payload weiter verarbeiten
+      parsePayload(servoID, pos);
+  } else {
+      // Ungültige Servo-ID
+      client.publish((String(DEVICE) + "/status").c_str(), ("Ungültige Servo-ID: " + String(servoID)).c_str());
+  }
 }
+
 
 
 void reconnect() {
   // Wiederherstellen der MQTT-Verbindung
   while (!client.connected()) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("No WIFI");
+    }
     Serial.print("Attempting MQTT connection...");
     if (client.connect(DEVICE, mqttUser, mqttPassword)) {
       Serial.println("connected");
       // Hier kannst du die Nachricht senden
       client.publish(DEVICE"/status", "Connected");
       // Abonnieren von Nachrichten
-      client.subscribe(DEVICE"/control");
+      client.subscribe(DEVICE "/turm/pos");
+      client.subscribe(DEVICE "/arm/pos");
+      client.subscribe(DEVICE "/arm1/pos");
+      client.subscribe(DEVICE "/greifer/pos");
+;
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -56,9 +148,11 @@ void reconnect() {
   }
 }
 
+
 void setup() {
   // Beginnen Sie mit der seriellen Kommunikation
   Serial.begin(115200);
+  Serial.println();
   Serial.println("Booting...");
 
   // WiFi-Modus auf Station (STA) setzen
@@ -114,9 +208,12 @@ void setup() {
   client.setServer(mqttServer, mqttPort);
   client.setCallback(callback);
 
+  Wire.begin();
+
   // Initialisiere Servo PWM
   pwm.begin();
-  pwm.setPWMFreq(60);  // Setze PWM-Frequenz auf 60 Hz
+  pwm.setOscillatorFrequency(27000000);
+  pwm.setPWMFreq(SERVO_FREQ);  // Analog servos run at ~50 Hz updates
 
 }
 
