@@ -7,8 +7,6 @@
 
 // Servo-Einstellungen
 #define PCA9685_ADDR 0x40
-//#define SERVOMIN  150
-//#define SERVOMAX  590
 #define SMOOTHNESS 2
 #define INVALID_SERVO -1 // Beispielwert für eine ungültige Servo-ID
 #define DEVICE "armUnit"
@@ -21,8 +19,9 @@ const int servoDegrees[] = {180, 180, 180, 180};
 const int servoMinPos[] = {180, 180, 180, 10};
 const int servoMaxPos[] = {180, 180, 180, 80};
 
+//init-Werte zur Laufzeit die aktuelle Position des Servos
+uint16_t currentServoPos[] = {0, 0, 10, 80}; 
 bool servosInitialized = false;
-uint16_t currentServoPos[] = {0, 0, 10, 80}; //auch init-Werte
 
 enum ServoID {
   TURM = 0,
@@ -44,65 +43,27 @@ ServoID getServoID(const char* typeString) {
     else return TURM;
 }
 
-#define KP 1.0 // Proportional gain
-#define KI 0.0 // Integral gain
-#define KD 0.0 // Derivative gain
-
-double errorSum = 0.0; // Accumulated error for integral control
-double lastError = 0.0; // Last error for derivative control
-unsigned long lastTime = 0; // Last time for derivative control
-
-void moveServosPID(int servoID, int targetPos) {
-  // Get the current position
-  int currentPos = currentServoPos[servoID];
-
-  // Map the target position from 0-180 to the range 150-590
-  uint16_t mappedTargetPos = map(targetPos, 0, 180, 150, 590);
-  
-  // Calculate the error
-  double error = mappedTargetPos - currentPos;
-
-  // Get current time
-  unsigned long now = millis();
-  // Calculate time difference
-  double dt = (now - lastTime) / 1000.0; // Convert to seconds
-  // Update last time
-  lastTime = now;
-
-  // Proportional control
-  double P = KP * error;
-
-  // Integral control
-  errorSum += error * dt;
-  double I = KI * errorSum;
-
-  // Derivative control
-  double D = KD * (error - lastError) / dt;
-  lastError = error;
-
-  // Calculate control signal
-  double controlSignal = P + I + D;
-
-  // Apply control signal to the servo
-  int nextPos = constrain(currentPos + controlSignal, SERVOMIN[servoID], SERVOMAX[servoID]);
-  pwm.setPWM(servoID, 0, nextPos);
-  currentServoPos[servoID] = nextPos;
-}
-
-
+/// @brief Ansteuerung des Servos
+/// @param servoID 0 - 3
+/// @param pulse in PWM
 void rawServoMovement(int servoID, int pulse) {
   Serial.print("raw Movenment to: ");
   Serial.println(pulse);
   pwm.setPWM(servoPins[servoID], 0, pulse);
 }
 
-
+/// @brief Ansteuerung des Servos 
+/// @param servoID 0-3
+/// @param pos in Grad
 void controlServo(int servoID, int pos) {
   Serial.print("pos Movenment");
   uint16_t pulse = map(pos, 0, servoDegrees[servoID], SERVOMIN[servoID], SERVOMAX[servoID]);
   pwm.setPWM(servoPins[servoID], 0, pulse);
 }
 
+/// @brief Zerlegung der MQTT-Nachricht
+/// @param servoID 
+/// @param pos 
 void parsePayload(int servoID, int pos) {
   if (pos <= servoMaxPos[servoID]) {
     controlServo(servoID, pos);
@@ -112,6 +73,10 @@ void parsePayload(int servoID, int pos) {
   }
 }
 
+/// @brief Behandlung der MQTT Nachrichten-Themen
+/// @param topic 
+/// @param payload 
+/// @param length 
 void callback(char* topic, byte* payload, unsigned int length) {
   char* token = strtok(topic, "/");
   token = strtok(NULL, "/");
@@ -132,7 +97,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
   }
 }
 
-
+/// @brief MQTT Verbindungsbehandlung
 void reconnect() {
   while (!client.connected()) {
     if (WiFi.status() != WL_CONNECTED) {
@@ -155,6 +120,7 @@ void reconnect() {
   }
 }
 
+/// @brief Initialisierung der Servos um eine definierte Position zu erhalten
 void initServos() {
   for (int sID = 0; sID < NUM_SERVOS; sID++){
     controlServo(sID, currentServoPos[sID]);
