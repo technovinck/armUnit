@@ -1,144 +1,151 @@
-#include <spi.h>
 #include <Wire.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 #include <PubSubClient.h>
 #include <Adafruit_PWMServoDriver.h>
-#include <config.h> //enthält Zugangsdaten für das Heimnetz
+#include <config.h> // Enthält Zugangsdaten für das Heimnetz
 
-#define PCA9685_ADDR 0x40 // Adresse des PCA9685-Treibers
-#define SERVO_MIN_PULSEWIDTH 900 //650
-#define SERVO_MAX_PULSEWIDTH 2100 //2350
-//#define SERVO_MAX_DEGREE 180
-#define SERVO_FREQ 50
+// Servo-Einstellungen
+#define PCA9685_ADDR 0x40
+//#define SERVOMIN  150
+//#define SERVOMAX  590
+#define SMOOTHNESS 2
+#define INVALID_SERVO -1 // Beispielwert für eine ungültige Servo-ID
+#define DEVICE "armUnit"
 
+const int minStep = 1;
+const int servoPins[] = {0, 1, 2, 3};
+const int SERVOMIN[] = {150, 150, 100, 150};
+const int SERVOMAX[] = {590, 590, 450, 590};
+const int servoDegrees[] = {180, 180, 180, 180};
+const int servoMinPos[] = {180, 180, 180, 10};
+const int servoMaxPos[] = {180, 180, 180, 80};
 
-#define DEVICE "armUnit" // hier den unit-name aendern
+bool servosInitialized = false;
+uint16_t currentServoPos[] = {0, 0, 10, 80}; //auch init-Werte
+
 enum ServoID {
   TURM = 0,
-  ARM = 1,
-  ARM1 = 2,
-  GREIFER = 3
+  ARM,
+  ARM1,
+  GREIFER,
+  NUM_SERVOS
 };
 
-// Pin-Nummern für die Servos auf dem PCA9685-Controller
-const int servoPins[] = {0, 1, 2, 3}; // Beispielwerte, anpassen entsprechend der tatsächlichen Verdrahtung
-const int servoDegrees[] = {180, 180, 180, 180};
-//const int servoMinPWM[] = {90, 90, 180, 180};
-//const int servoMaxPWM[] = {90, 90, 180, 180};
-
-
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(PCA9685_ADDR);
-
-bool servoExecuted = false;
-
 WiFiClient espClient;
 PubSubClient client(espClient);
 
 ServoID getServoID(const char* typeString) {
-    Serial.print("Token: ");
-    Serial.println(typeString);
-    if (strcmp(typeString, "turm") == 0) {
-        Serial.println("ServoId erkannt: turm");
-        return TURM;
-    } else if (strcmp(typeString, "arm") == 0) {
-        return ARM;
-    } else if (strcmp(typeString, "arm1") == 0) {
-        return ARM1;
-    } else if (strcmp(typeString, "greifer") == 0) {
-        return GREIFER;
-    } else {
-        // Default-Wert oder Fehlerbehandlung
-        return TURM; // Zum Beispiel, hier könnte auch ein Default-Wert zurückgegeben werden
-    }
+    if (strcmp(typeString, "turm") == 0) return TURM;
+    else if (strcmp(typeString, "arm") == 0) return ARM;
+    else if (strcmp(typeString, "arm1") == 0) return ARM1;
+    else if (strcmp(typeString, "greifer") == 0) return GREIFER;
+    else return TURM;
 }
 
+#define KP 1.0 // Proportional gain
+#define KI 0.0 // Integral gain
+#define KD 0.0 // Derivative gain
 
-void controlServo(int servoIndex, int pos) {
-  // Begrenze die Position auf den erwarteten Bereich (0-180)
-  if(servoIndex >= 0 && servoIndex <= 1){
-    pos = constrain(pos, 0, servoDegrees[servoIndex]);
-  } else {
-    pos = constrain(pos, 0, servoDegrees[servoIndex]);
-  };
+double errorSum = 0.0; // Accumulated error for integral control
+double lastError = 0.0; // Last error for derivative control
+unsigned long lastTime = 0; // Last time for derivative control
+
+void moveServosPID(int servoID, int targetPos) {
+  // Get the current position
+  int currentPos = currentServoPos[servoID];
+
+  // Map the target position from 0-180 to the range 150-590
+  uint16_t mappedTargetPos = map(targetPos, 0, 180, 150, 590);
   
-  // Konvertiere die Position von Grad in Pulsweite
-  uint16_t pulse = map(pos, 0, servoDegrees[servoIndex], SERVO_MIN_PULSEWIDTH, SERVO_MAX_PULSEWIDTH);
-  Serial.println(pulse);
-  // Setze die Pulsweite für den entsprechenden Servo-Kanal auf dem PCA9685-Controller
-  pwm.setPWM(servoPins[servoIndex], 0, pulse);
+  // Calculate the error
+  double error = mappedTargetPos - currentPos;
+
+  // Get current time
+  unsigned long now = millis();
+  // Calculate time difference
+  double dt = (now - lastTime) / 1000.0; // Convert to seconds
+  // Update last time
+  lastTime = now;
+
+  // Proportional control
+  double P = KP * error;
+
+  // Integral control
+  errorSum += error * dt;
+  double I = KI * errorSum;
+
+  // Derivative control
+  double D = KD * (error - lastError) / dt;
+  lastError = error;
+
+  // Calculate control signal
+  double controlSignal = P + I + D;
+
+  // Apply control signal to the servo
+  int nextPos = constrain(currentPos + controlSignal, SERVOMIN[servoID], SERVOMAX[servoID]);
+  pwm.setPWM(servoID, 0, nextPos);
+  currentServoPos[servoID] = nextPos;
 }
 
-String formatStatusMessage(int servoID, int pos) {
-  return "Servo-ID " + String(servoID) + " auf " + String(pos) + " Grad gefahren";
+
+void rawServoMovement(int servoID, int pulse) {
+  Serial.print("raw Movenment to: ");
+  Serial.println(pulse);
+  pwm.setPWM(servoPins[servoID], 0, pulse);
+}
+
+
+void controlServo(int servoID, int pos) {
+  Serial.print("pos Movenment");
+  uint16_t pulse = map(pos, 0, servoDegrees[servoID], SERVOMIN[servoID], SERVOMAX[servoID]);
+  pwm.setPWM(servoPins[servoID], 0, pulse);
 }
 
 void parsePayload(int servoID, int pos) {
-  // Steuern Sie den entsprechenden Servo auf dem PCA9685-Controller
-  controlServo(servoID, pos);
-
-  // Veröffentlichen Sie eine Bestätigungsnachricht
-  String topic = String(DEVICE) + "/status";
-  String statusMessage = "Servo-ID " + String(servoID) + " auf " + String(pos) + " Grad gefahren";
-  client.publish(topic.c_str(), statusMessage.c_str());
+  if (pos <= servoMaxPos[servoID]) {
+    controlServo(servoID, pos);
+    client.publish(String(DEVICE "/status").c_str(), "Servo position set");
+  } else {
+    client.publish(String(DEVICE "/status").c_str(), "Invalid servo position");
+  }
 }
 
-
 void callback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Message arrived [");
-  Serial.print(topic);
-  Serial.println("] ");
-
-  // Extrahiere Servo-Typ und Servo-ID aus dem Topic
   char* token = strtok(topic, "/");
-  // Ignoriere den ersten Token (Gerätenamen)
   token = strtok(NULL, "/");
-  char* servoType = token;
-  int servoID = getServoID(servoType);
+  int servoID = getServoID(token);
   token = strtok(NULL, "/");
-  Serial.print("servoID: ");
-  Serial.println(servoID);
-
-  char posString[10];
-  memcpy(posString, payload, length);
-  posString[length] = '\0'; // Nullterminierung für die Konvertierung
-  int pos = atoi(posString);
-
-
-  // Verarbeite die Nachricht nur, wenn die Servo-ID im gültigen Bereich liegt
-  if (servoID >= TURM && servoID <= GREIFER) {
-      // Veröffentliche die verarbeiteten Daten
-      //char topicProcessed[50];
-      //snprintf(topicProcessed, sizeof(topicProcessed), "%s/%d/processed", servoType, servoID);
-      //client.publish(topicProcessed, servoType); // Veröffentliche das ursprüngliche Payload unter dem neuen Topic
-
-      // Payload weiter verarbeiten
-      parsePayload(servoID, pos);
-  } else {
-      // Ungültige Servo-ID
-      client.publish((String(DEVICE) + "/status").c_str(), ("Ungültige Servo-ID: " + String(servoID)).c_str());
+  
+  if (token != NULL) {
+    String subTopic = String(token);
+    if (subTopic.equals("pos") || subTopic.equals("raw")) {
+      int pos = atoi((char *)payload);
+      if (servoID >= 0 && servoID < NUM_SERVOS) {
+        if (subTopic.equals("raw")) rawServoMovement(servoID, pos);
+        else parsePayload(servoID, pos);
+      } else {
+        client.publish(String(DEVICE "/status").c_str(), "Invalid servo ID");
+      }
+    }
   }
 }
 
 
-
 void reconnect() {
-  // Wiederherstellen der MQTT-Verbindung
   while (!client.connected()) {
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println("No WIFI");
+      delay(500);
+      return;
     }
     Serial.print("Attempting MQTT connection...");
     if (client.connect(DEVICE, mqttUser, mqttPassword)) {
       Serial.println("connected");
-      // Hier kannst du die Nachricht senden
-      client.publish(DEVICE"/status", "Connected");
-      // Abonnieren von Nachrichten
-      client.subscribe(DEVICE "/turm/pos");
-      client.subscribe(DEVICE "/arm/pos");
-      client.subscribe(DEVICE "/arm1/pos");
-      client.subscribe(DEVICE "/greifer/pos");
-;
+      client.publish(DEVICE "/status", "Connected");
+      client.subscribe(DEVICE "/+/pos");
+      client.subscribe(DEVICE "/+/raw");
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -148,89 +155,37 @@ void reconnect() {
   }
 }
 
+void initServos() {
+  for (int sID = 0; sID < NUM_SERVOS; sID++){
+    controlServo(sID, currentServoPos[sID]);
+  }
+  Serial.println("ServoInit complete");
+}
 
 void setup() {
-  // Beginnen Sie mit der seriellen Kommunikation
   Serial.begin(115200);
-  Serial.println();
   Serial.println("Booting...");
-
-  // WiFi-Modus auf Station (STA) setzen
   WiFi.mode(WIFI_STA);
-  
-  // Verbindung zum vorhandenen WLAN-Netzwerk herstellen
   WiFi.begin(ssid, password);
-  Serial.print("Verbindung zum WLAN herstellen");
+  Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
       delay(500);
       Serial.print(".");
   }
-  Serial.println("");
-  Serial.println("Verbunden mit WLAN");
-
-  // Überprüfen, ob eine Verbindung hergestellt wurde
-  if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("Keine Verbindung zum WLAN hergestellt. Access Point starten.");
-
-      // WiFi-Modus auf Access Point (AP) setzen
-      WiFi.mode(WIFI_AP);
-      
-      // Access Point konfigurieren
-      WiFi.softAP(hotspotSSID, hotspotPassword);
-      Serial.println("Access Point gestartet.");
-  }
-
-  // Initialisiere ArduinoOTA
-  ArduinoOTA.onStart([]() {
-      Serial.println("Starte OTA-Aktualisierung");
-  });
-
-  ArduinoOTA.onEnd([]() {
-      Serial.println("\nOTA-Aktualisierung abgeschlossen");
-  });
-
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-      Serial.printf("Fortschritt: %u%%\r", (progress / (total / 100)));
-  });
-
-  ArduinoOTA.onError([](ota_error_t error) {
-      Serial.printf("OTA-Fehler [%u]: ", error);
-      if (error == OTA_AUTH_ERROR) Serial.println("Authentifizierung fehlgeschlagen");
-      else if (error == OTA_BEGIN_ERROR) Serial.println("OTA-Begin fehlgeschlagen");
-      else if (error == OTA_CONNECT_ERROR) Serial.println("OTA-Verbindung fehlgeschlagen");
-      else if (error == OTA_RECEIVE_ERROR) Serial.println("OTA-Empfangsfehler");
-      else if (error == OTA_END_ERROR) Serial.println("OTA-Endfehler");
-  });
-
+  Serial.println("\nConnected to WiFi");
   ArduinoOTA.begin();
-  
-  // initialisiere MQTT
   client.setServer(mqttServer, mqttPort);
   client.setCallback(callback);
-
-  Wire.begin();
-
-  // Initialisiere Servo PWM
   pwm.begin();
   pwm.setOscillatorFrequency(27000000);
-  pwm.setPWMFreq(SERVO_FREQ);  // Analog servos run at ~50 Hz updates
-
+  pwm.setPWMFreq(50);
+  initServos();
 }
 
-void loop() 
-{
+void loop() {
   ArduinoOTA.handle();
-
-  // Überprüfen, ob eine Verbindung zum MQTT-Broker hergestellt ist
   if (!client.connected()) {
     reconnect();
   }
-  // MQTT-Nachrichten verarbeiten
   client.loop();
-
-  // Senden Sie eine MQTT-Nachricht, wenn der Servobefehl ausgeführt wurde
-  if (servoExecuted) {
-    client.publish(DEVICE"/status", "Servo command executed");
-    servoExecuted = false;
-  }
 }
