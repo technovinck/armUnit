@@ -1,100 +1,116 @@
-#include <spi.h>
-#include "webpage.h"
+#include <Wire.h>
 #include <WiFi.h>
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
 #include <ArduinoOTA.h>
 #include <PubSubClient.h>
 #include <Adafruit_PWMServoDriver.h>
-#include <config.h> //enthält Zugangsdaten für das Heimnetz
+#include <config.h> // Enthält Zugangsdaten für das Heimnetz
 
+// Servo-Einstellungen
+#define PCA9685_ADDR 0x40
+#define SMOOTHNESS 2
+#define INVALID_SERVO -1 // Beispielwert für eine ungültige Servo-ID
+#define DEVICE "armUnit"
+
+const int minStep = 1;
+const int servoPins[] = {0, 1, 2, 3};
+const int SERVOMIN[] = {150, 150, 100, 150};
+const int SERVOMAX[] = {590, 590, 450, 590};
+const int servoDegrees[] = {180, 180, 180, 180};
+const int servoMinPos[] = {180, 180, 180, 10};
+const int servoMaxPos[] = {180, 180, 180, 80};
+
+//init-Werte zur Laufzeit die aktuelle Position des Servos
+uint16_t currentServoPos[] = {0, 0, 10, 80}; 
+bool servosInitialized = false;
+
+enum ServoID {
+  TURM = 0,
+  ARM,
+  ARM1,
+  GREIFER,
+  NUM_SERVOS
+};
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(PCA9685_ADDR);
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-AsyncWebServer server(80);
-AsyncWebSocket ws("/ws");
-
-#define PCA9685_ADDR 0x40 // Adresse des PCA9685-Treibers
-#define SERVO_MIN_PULSEWIDTH 650
-#define SERVO_MAX_PULSEWIDTH 2350
-#define SERVO_MAX_DEGREE 180
-
-Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(PCA9685_ADDR);
-
-bool servoExecuted = false;
-
-//Webserver Funktionen
-void handleRoot(AsyncWebServerRequest *request) {
-  request->send_P(200, "text/html", rootPage);
+ServoID getServoID(const char* typeString) {
+    if (strcmp(typeString, "turm") == 0) return TURM;
+    else if (strcmp(typeString, "arm") == 0) return ARM;
+    else if (strcmp(typeString, "arm1") == 0) return ARM1;
+    else if (strcmp(typeString, "greifer") == 0) return GREIFER;
+    else return TURM;
 }
 
-void handleNotFound(AsyncWebServerRequest *request) {
-    request->send(404, "text/plain", "File Not Found");
+/// @brief Ansteuerung des Servos
+/// @param servoID 0 - 3
+/// @param pulse in PWM
+void rawServoMovement(int servoID, int pulse) {
+  Serial.print("raw Movenment to: ");
+  Serial.println(pulse);
+  pwm.setPWM(servoPins[servoID], 0, pulse);
 }
 
-void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *webSocketClient, AwsEventType type, void *arg, uint8_t *data, size_t len) {                      
-  switch (type) {
-    case WS_EVT_CONNECT:
-      Serial.printf("WebSocket client #%u connected from %s\n", webSocketClient->id(), webSocketClient->remoteIP().toString().c_str());
-      break;
-    case WS_EVT_DISCONNECT:
-      Serial.printf("WebSocket client #%u disconnected\n", webSocketClient->id());
-      break;
-    case WS_EVT_DATA:
-      AwsFrameInfo *info;
-      info = (AwsFrameInfo*)arg;
-      if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
-        String message = String((char *)data);
-        int servoAngle = message.toInt();
-        if (servoAngle >= 0 && servoAngle <= SERVO_MAX_DEGREE) {
-          pwm.setPWM(0, 0, map(servoAngle, 0, SERVO_MAX_DEGREE, SERVO_MIN_PULSEWIDTH, SERVO_MAX_PULSEWIDTH));
-          Serial.println("Servo position set: " + String(servoAngle));
-          // Senden Sie eine MQTT-Nachricht, wenn der Servobefehl empfangen und ausgeführt wurde
-          client.publish("armUnit/status", "Servo command received and executed");
-          servoExecuted = true;
-        } else {
-          Serial.println("Invalid servo angle: " + String(servoAngle));
-        }
-      }
-      break;
-    case WS_EVT_PONG:
-    case WS_EVT_ERROR:
-      break;
-    default:
-      break;  
+/// @brief Ansteuerung des Servos 
+/// @param servoID 0-3
+/// @param pos in Grad
+void controlServo(int servoID, int pos) {
+  Serial.print("pos Movenment");
+  uint16_t pulse = map(pos, 0, servoDegrees[servoID], SERVOMIN[servoID], SERVOMAX[servoID]);
+  pwm.setPWM(servoPins[servoID], 0, pulse);
+}
+
+/// @brief Zerlegung der MQTT-Nachricht
+/// @param servoID 
+/// @param pos 
+void parsePayload(int servoID, int pos) {
+  if (pos <= servoMaxPos[servoID]) {
+    controlServo(servoID, pos);
+    client.publish(String(DEVICE "/status").c_str(), "Servo position set");
+  } else {
+    client.publish(String(DEVICE "/status").c_str(), "Invalid servo position");
   }
 }
 
-
-// Funktion zum Empfangen von MQTT-Nachrichten
+/// @brief Behandlung der MQTT Nachrichten-Themen
+/// @param topic 
+/// @param payload 
+/// @param length 
 void callback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Message arrived [");
-  Serial.print(topic);
-  Serial.print("] ");
+  char* token = strtok(topic, "/");
+  token = strtok(NULL, "/");
+  int servoID = getServoID(token);
+  token = strtok(NULL, "/");
   
-  // Null-terminiertes Zeichenarray erstellen
-  char message[length + 1]; // +1 für das Nullzeichen
-  memcpy(message, payload, length);
-  message[length] = '\0'; // Nullterminierung hinzufügen
-  
-  // Nachricht als String ausgeben
-  Serial.println(message);
-  client.publish("armUnit/status", "Nachricht erhalten!");
-
-  // Hier können Sie die Payload weiter verarbeiten
+  if (token != NULL) {
+    String subTopic = String(token);
+    if (subTopic.equals("pos") || subTopic.equals("raw")) {
+      int pos = atoi((char *)payload);
+      if (servoID >= 0 && servoID < NUM_SERVOS) {
+        if (subTopic.equals("raw")) rawServoMovement(servoID, pos);
+        else parsePayload(servoID, pos);
+      } else {
+        client.publish(String(DEVICE "/status").c_str(), "Invalid servo ID");
+      }
+    }
+  }
 }
 
-
+/// @brief MQTT Verbindungsbehandlung
 void reconnect() {
-  // Wiederherstellen der MQTT-Verbindung
   while (!client.connected()) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("No WIFI");
+      delay(500);
+      return;
+    }
     Serial.print("Attempting MQTT connection...");
-    if (client.connect("armUnit", mqttUser, mqttPassword)) {
+    if (client.connect(DEVICE, mqttUser, mqttPassword)) {
       Serial.println("connected");
-      // Hier kannst du die Nachricht senden
-      client.publish("armUnit/status", "Connected");
-      // Abonnieren von Nachrichten
-      client.subscribe("armUnit/control");
+      client.publish(DEVICE "/status", "Connected");
+      client.subscribe(DEVICE "/+/pos");
+      client.subscribe(DEVICE "/+/raw");
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -104,107 +120,38 @@ void reconnect() {
   }
 }
 
+/// @brief Initialisierung der Servos um eine definierte Position zu erhalten
+void initServos() {
+  for (int sID = 0; sID < NUM_SERVOS; sID++){
+    controlServo(sID, currentServoPos[sID]);
+  }
+  Serial.println("ServoInit complete");
+}
+
 void setup() {
-    // Beginnen Sie mit der seriellen Kommunikation
-    Serial.begin(115200);
-    Serial.println("Booting...");
-
-    // WiFi-Modus auf Station (STA) setzen
-    WiFi.mode(WIFI_STA);
-    
-    // Verbindung zum vorhandenen WLAN-Netzwerk herstellen
-    WiFi.begin(ssid, password);
-    Serial.print("Verbindung zum WLAN herstellen");
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-    Serial.println("");
-    Serial.println("Verbunden mit WLAN");
-
-    // Überprüfen, ob eine Verbindung hergestellt wurde
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("Keine Verbindung zum WLAN hergestellt. Access Point starten.");
-
-        // WiFi-Modus auf Access Point (AP) setzen
-        WiFi.mode(WIFI_AP);
-        
-        // Access Point konfigurieren
-        WiFi.softAP(hotspotSSID, hotspotPassword);
-        Serial.println("Access Point gestartet.");
-    }
-
- 
-  // Initialisiere Servo PWM
-  pwm.begin();
-  pwm.setPWMFreq(60);  // Setze PWM-Frequenz auf 60 Hz
-
-  // Setup code...
-
-  // initialisiere Webserver
-  server.on("/", HTTP_GET, handleRoot);
-  server.onNotFound(handleNotFound);
-
-  ws.onEvent(onWebSocketEvent);
-  server.addHandler(&ws);
-
-  server.begin();
-  Serial.println("HTTP server started");
-
-  // Initialisiere ArduinoOTA
-  ArduinoOTA.onStart([]() {
-      Serial.println("Starte OTA-Aktualisierung");
-  });
-
-  ArduinoOTA.onEnd([]() {
-      Serial.println("\nOTA-Aktualisierung abgeschlossen");
-  });
-
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-      Serial.printf("Fortschritt: %u%%\r", (progress / (total / 100)));
-  });
-
-  ArduinoOTA.onError([](ota_error_t error) {
-      Serial.printf("OTA-Fehler [%u]: ", error);
-      if (error == OTA_AUTH_ERROR) Serial.println("Authentifizierung fehlgeschlagen");
-      else if (error == OTA_BEGIN_ERROR) Serial.println("OTA-Begin fehlgeschlagen");
-      else if (error == OTA_CONNECT_ERROR) Serial.println("OTA-Verbindung fehlgeschlagen");
-      else if (error == OTA_RECEIVE_ERROR) Serial.println("OTA-Empfangsfehler");
-      else if (error == OTA_END_ERROR) Serial.println("OTA-Endfehler");
-  });
-
-  ArduinoOTA.begin();
-  
-  // initialisiere MQTT
-  client.setServer(mqttServer, mqttPort);
-  client.setCallback(callback);
-
-  // initialisiere WiFi-Verbindung
+  Serial.begin(115200);
+  Serial.println("Booting...");
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+      delay(500);
+      Serial.print(".");
   }
-  Serial.println("");
-  Serial.println("WiFi connected");
+  Serial.println("\nConnected to WiFi");
+  ArduinoOTA.begin();
+  client.setServer(mqttServer, mqttPort);
+  client.setCallback(callback);
+  pwm.begin();
+  pwm.setOscillatorFrequency(27000000);
+  pwm.setPWMFreq(50);
+  initServos();
 }
 
-void loop() 
-{
+void loop() {
   ArduinoOTA.handle();
-  ws.cleanupClients();
-
-  // Überprüfen, ob eine Verbindung zum MQTT-Broker hergestellt ist
   if (!client.connected()) {
     reconnect();
   }
-  // MQTT-Nachrichten verarbeiten
   client.loop();
-
-  // Senden Sie eine MQTT-Nachricht, wenn der Servobefehl ausgeführt wurde
-  if (servoExecuted) {
-    client.publish("armUnit/status", "Servo command executed");
-    servoExecuted = false;
-  }
 }
