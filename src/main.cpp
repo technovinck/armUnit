@@ -153,7 +153,7 @@ void handlePos(int servoID, String message) {
     // Code zur Verarbeitung der Position für den angegebenen Servo
     int pos = message.toInt();
     if (pos >= servoMinPos[servoID] && pos <= servoMaxPos[servoID]) {
-        controlServo(servoID, pos);
+        controlServo(servoID, pos, 10);
         client.publish(String(DEVICE "/status").c_str(), "Servo position set");
     } else {
         client.publish(String(DEVICE "/status").c_str(), "Invalid servo position");
@@ -217,10 +217,12 @@ void callback(char* topic, byte* payload, unsigned int length) {
     // Suche den passenden Handler für das Topic und rufe ihn auf
     if (strcmp(command, "pos") == 0) {
         handlePos(getServoID(component), value);
+    } else if (strcmp(command, "smoothpos") == 0) {
+        controlServo(getServoID(component), value.toInt(), smoothness);
     } else if (strcmp(command, "raw") == 0) {
         handleRawPos(getServoID(component), value);
     } else if (strcmp(command, "smoothness") == 0) {
-        handleSmoothness(getServoID(component), value);
+        smoothness = value.toInt();
     } else if (strcmp(command, "rangecontrol_ON") == 0) {
         handleRangeControl(getServoID(component), value);
     } else {
